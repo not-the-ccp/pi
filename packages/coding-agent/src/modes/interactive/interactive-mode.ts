@@ -3071,6 +3071,15 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/continue") {
+				this.editor.setText("");
+				try {
+					await this.session.continueTurn();
+				} catch (error) {
+					this.showError(error instanceof Error ? error.message : String(error));
+				}
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();

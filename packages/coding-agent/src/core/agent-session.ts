@@ -1102,10 +1102,10 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentOperation(start: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await start();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
@@ -1115,6 +1115,34 @@ export class AgentSession {
 			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
 		}
+	}
+
+	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._runAgentOperation(() => this.agent.prompt(messages));
+	}
+
+	private async _runAgentContinuation(): Promise<void> {
+		await this._runAgentOperation(() => this.agent.continue());
+	}
+
+	private async _validateModelAndAuth(): Promise<void> {
+		if (!this.model) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+
+		const hasConfiguredAuth =
+			this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
+			(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+		if (hasConfiguredAuth) return;
+
+		if (this._modelRuntime.isUsingOAuth(this.model.provider)) {
+			throw new Error(
+				`Authentication failed for "${this.model.provider}". ` +
+					`Credentials may have expired or network is unavailable. ` +
+					`Run '/login ${this.model.provider}' to re-authenticate.`,
+			);
+		}
+		throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1226,25 +1254,7 @@ export class AgentSession {
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 
-			// Validate model
-			if (!this.model) {
-				throw new Error(formatNoModelSelectedMessage());
-			}
-
-			const hasConfiguredAuth =
-				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
-			if (!hasConfiguredAuth) {
-				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
-				if (isOAuth) {
-					throw new Error(
-						`Authentication failed for "${this.model.provider}". ` +
-							`Credentials may have expired or network is unavailable. ` +
-							`Run '/login ${this.model.provider}' to re-authenticate.`,
-					);
-				}
-				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-			}
+			await this._validateModelAndAuth();
 
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
@@ -1314,6 +1324,50 @@ export class AgentSession {
 
 		preflightResult?.(true);
 		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Continue an unfinished turn without appending a user message.
+	 *
+	 * A trailing errored or aborted assistant message is removed from active agent
+	 * state before continuing. It remains in the append-only session history and
+	 * is filtered from provider context by message conversion. This resumes from
+	 * the preceding user message or completed tool result without replaying partial
+	 * assistant output or reasoning.
+	 */
+	async continueTurn(): Promise<void> {
+		if (!this.isIdle) {
+			throw new Error("Agent is still running. Wait for it to finish or press Esc to abort it first.");
+		}
+		if (this._compactionAbortController !== undefined || this._autoCompactionAbortController !== undefined) {
+			throw new Error("Cannot continue while compaction is in progress.");
+		}
+
+		await this._validateModelAndAuth();
+
+		const messages = this.agent.state.messages;
+		const lastMessage = messages[messages.length - 1];
+		if (!lastMessage) {
+			throw new Error("No unfinished turn to continue.");
+		}
+
+		let continuationMessages = messages;
+		if (lastMessage.role === "assistant") {
+			if (lastMessage.stopReason !== "error" && lastMessage.stopReason !== "aborted") {
+				throw new Error("The last assistant turn completed normally; there is nothing to continue.");
+			}
+			continuationMessages = messages.slice(0, -1);
+		}
+
+		const continuationTail = continuationMessages[continuationMessages.length - 1];
+		if (!continuationTail || continuationTail.role === "assistant") {
+			throw new Error("No valid message remains to continue from.");
+		}
+
+		this.agent.state.messages = continuationMessages;
+		this._retryAttempt = 0;
+		this._overflowRecoveryAttempted = false;
+		await this._runAgentContinuation();
 	}
 
 	/**

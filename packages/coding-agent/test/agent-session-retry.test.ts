@@ -74,11 +74,13 @@ describe("AgentSession retry", () => {
 		baseDelayMs?: number;
 		maxAgentDelayMs?: number;
 		delayAssistantMessageEndMs?: number;
+		failureStopReason?: "error" | "aborted";
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
 		const baseDelayMs = options?.baseDelayMs ?? 1;
 		const delayAssistantMessageEndMs = options?.delayAssistantMessageEndMs ?? 0;
+		const failureStopReason = options?.failureStopReason ?? "error";
 		let callCount = 0;
 
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -91,11 +93,11 @@ describe("AgentSession retry", () => {
 				queueMicrotask(() => {
 					if (callCount <= failCount) {
 						const msg = createAssistantMessage("", {
-							stopReason: "error",
-							errorMessage: "overloaded_error",
+							stopReason: failureStopReason,
+							errorMessage: failureStopReason === "error" ? "overloaded_error" : "Request was aborted.",
 						});
 						stream.push({ type: "start", partial: msg });
-						stream.push({ type: "error", reason: "error", error: msg });
+						stream.push({ type: "error", reason: failureStopReason, error: msg });
 					} else {
 						const msg = createAssistantMessage("Success");
 						stream.push({ type: "start", partial: msg });
@@ -135,7 +137,7 @@ describe("AgentSession retry", () => {
 			};
 		}
 
-		return { session, getCallCount: () => callCount };
+		return { session, sessionManager, getCallCount: () => callCount };
 	}
 
 	it("retries after a transient error and succeeds", async () => {
@@ -181,6 +183,96 @@ describe("AgentSession retry", () => {
 
 		expect(created.getCallCount()).toBe(5);
 		expect(delays).toEqual([2, 3, 3, 3]);
+	});
+
+	it("manually continues an error after automatic retries are exhausted", async () => {
+		const created = await createSession({ failCount: 1, maxRetries: 0 });
+
+		await created.session.prompt("Test");
+		expect(created.getCallCount()).toBe(1);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+
+		await created.session.continueTurn();
+
+		expect(created.getCallCount()).toBe(2);
+		expect(created.session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(
+			created.sessionManager
+				.getEntries()
+				.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						entry.message.stopReason === "error",
+				),
+		).toBe(true);
+	});
+
+	it("manually continues after an aborted assistant response", async () => {
+		const created = await createSession({ failCount: 1, maxRetries: 0, failureStopReason: "aborted" });
+
+		await created.session.prompt("Test");
+		await created.session.continueTurn();
+
+		expect(created.getCallCount()).toBe(2);
+		expect(created.session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("continues directly from a persisted user message", async () => {
+		const created = await createSession({ failCount: 0 });
+		const userMessage = { role: "user" as const, content: [{ type: "text" as const, text: "Test" }], timestamp: 1 };
+		created.session.state.messages = [userMessage];
+		created.sessionManager.appendMessage(userMessage);
+
+		await created.session.continueTurn();
+
+		expect(created.getCallCount()).toBe(1);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("continues directly from a completed tool result", async () => {
+		const created = await createSession({ failCount: 0 });
+		const userMessage = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "Use the tool" }],
+			timestamp: 1,
+		};
+		const toolCallMessage = createAssistantMessage("Calling tool", {
+			stopReason: "toolUse",
+			content: [
+				{ type: "text", text: "Calling tool" },
+				{ type: "toolCall", id: "call_1", name: "echo", arguments: { text: "hello" } },
+			],
+		});
+		const toolResultMessage = {
+			role: "toolResult" as const,
+			toolCallId: "call_1",
+			toolName: "echo",
+			content: [{ type: "text" as const, text: "hello" }],
+			isError: false,
+			timestamp: 2,
+		};
+		created.session.state.messages = [userMessage, toolCallMessage, toolResultMessage];
+		created.sessionManager.appendMessage(userMessage);
+		created.sessionManager.appendMessage(toolCallMessage);
+		created.sessionManager.appendMessage(toolResultMessage);
+
+		await created.session.continueTurn();
+
+		expect(created.getCallCount()).toBe(1);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
+	it("refuses to continue a normally completed assistant turn", async () => {
+		const created = await createSession({ failCount: 0 });
+		await created.session.prompt("Test");
+
+		await expect(created.session.continueTurn()).rejects.toThrow(
+			"The last assistant turn completed normally; there is nothing to continue.",
+		);
+		expect(created.getCallCount()).toBe(1);
 	});
 
 	it("prompt waits for retry completion even when assistant message_end handling is delayed", async () => {
