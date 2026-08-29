@@ -1329,11 +1329,12 @@ export class AgentSession {
 	/**
 	 * Continue an unfinished turn without appending a user message.
 	 *
-	 * A trailing errored or aborted assistant message is removed from active agent
-	 * state before continuing. It remains in the append-only session history and
-	 * is filtered from provider context by message conversion. This resumes from
-	 * the preceding user message or completed tool result without replaying partial
-	 * assistant output or reasoning.
+	 * Trailing errored or aborted assistant messages are removed from active agent
+	 * state before continuing. They remain in the append-only session history and
+	 * are filtered from provider context by message conversion. Removing the full
+	 * trailing run handles sessions rebuilt from multiple persisted automatic retry
+	 * failures and resumes from the preceding user message or completed tool result
+	 * without replaying partial assistant output or reasoning.
 	 */
 	async continueTurn(): Promise<void> {
 		if (!this.isIdle) {
@@ -1351,14 +1352,20 @@ export class AgentSession {
 			throw new Error("No unfinished turn to continue.");
 		}
 
-		let continuationMessages = messages;
-		if (lastMessage.role === "assistant") {
-			if (lastMessage.stopReason !== "error" && lastMessage.stopReason !== "aborted") {
-				throw new Error("The last assistant turn completed normally; there is nothing to continue.");
+		let continuationEnd = messages.length;
+		while (continuationEnd > 0) {
+			const message = messages[continuationEnd - 1];
+			if (message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) {
+				break;
 			}
-			continuationMessages = messages.slice(0, -1);
+			continuationEnd--;
 		}
 
+		if (lastMessage.role === "assistant" && continuationEnd === messages.length) {
+			throw new Error("The last assistant turn completed normally; there is nothing to continue.");
+		}
+
+		const continuationMessages = messages.slice(0, continuationEnd);
 		const continuationTail = continuationMessages[continuationMessages.length - 1];
 		if (!continuationTail || continuationTail.role === "assistant") {
 			throw new Error("No valid message remains to continue from.");

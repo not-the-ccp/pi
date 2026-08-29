@@ -209,6 +209,21 @@ describe("AgentSession retry", () => {
 		).toBe(true);
 	});
 
+	it("continues a reopened session after multiple persisted retry failures", async () => {
+		const created = await createSession({ failCount: 3, maxRetries: 2 });
+		await created.session.prompt("Test");
+
+		const restoredMessages = created.sessionManager.buildSessionContext().messages;
+		expect(restoredMessages.map((message) => message.role)).toEqual(["user", "assistant", "assistant", "assistant"]);
+		created.session.state.messages = restoredMessages;
+
+		await created.session.continueTurn();
+
+		expect(created.getCallCount()).toBe(4);
+		expect(created.session.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+		expect(created.session.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+	});
+
 	it("manually continues after an aborted assistant response", async () => {
 		const created = await createSession({ failCount: 1, maxRetries: 0, failureStopReason: "aborted" });
 
