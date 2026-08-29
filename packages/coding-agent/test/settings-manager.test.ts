@@ -377,6 +377,30 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("retry settings", () => {
+		it("defaults agent retry delays to a 30 second cap", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getRetrySettings()).toEqual({
+				enabled: true,
+				maxRetries: 3,
+				baseDelayMs: 2000,
+				maxDelayMs: 30000,
+			});
+		});
+
+		it("maps maxAgentDelayMs to the shared retry policy", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ retry: { maxRetries: 1000, maxAgentDelayMs: 180000 } }),
+			);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getRetrySettings()).toMatchObject({ maxRetries: 1000, maxDelayMs: 180000 });
+		});
+	});
+
 	describe("externalEditor", () => {
 		const originalVisual = process.env.VISUAL;
 		const originalEditor = process.env.EDITOR;

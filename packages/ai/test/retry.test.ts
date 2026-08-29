@@ -51,6 +51,17 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
+	it("matches upstream 503 connection failures", () => {
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "503 upstream call failed: Connect: Too many open files (os error 24)",
+				}),
+			),
+		).toBe(true);
+	});
+
 	it.each([
 		wrappedDnsLookupError,
 		"connect ENOTFOUND api.example.com",
@@ -146,6 +157,38 @@ describe("retryAssistantCall", () => {
 		expect(res.content).toEqual([{ type: "text", text: "recovered" }]);
 		expect(produce).toHaveBeenCalledTimes(3);
 		expect(onRetryFinished).toHaveBeenCalledWith(true, 2);
+	});
+
+	it("caps exponential backoff when maxDelayMs is set", async () => {
+		let n = 0;
+		const produce = vi.fn(async () => {
+			n++;
+			return n <= 4
+				? fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" })
+				: fauxAssistantMessage("recovered");
+		});
+		const onRetryScheduled = vi.fn();
+		const policy: RetryPolicy = { enabled: true, maxRetries: 4, baseDelayMs: 1, maxDelayMs: 2 };
+
+		await retryAssistantCall(produce, policy, undefined, { onRetryScheduled });
+
+		expect(onRetryScheduled.mock.calls.map((call) => call[2])).toEqual([1, 2, 2, 2]);
+	});
+
+	it("keeps exponential backoff uncapped when maxDelayMs is zero", async () => {
+		let n = 0;
+		const produce = vi.fn(async () => {
+			n++;
+			return n <= 3
+				? fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" })
+				: fauxAssistantMessage("recovered");
+		});
+		const onRetryScheduled = vi.fn();
+		const policy: RetryPolicy = { enabled: true, maxRetries: 3, baseDelayMs: 1, maxDelayMs: 0 };
+
+		await retryAssistantCall(produce, policy, undefined, { onRetryScheduled });
+
+		expect(onRetryScheduled.mock.calls.map((call) => call[2])).toEqual([1, 2, 4]);
 	});
 
 	it("reports an aborted retried call as unsuccessful", async () => {

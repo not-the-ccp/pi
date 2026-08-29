@@ -2905,7 +2905,8 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const exponentialDelayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = settings.maxDelayMs > 0 ? Math.min(exponentialDelayMs, settings.maxDelayMs) : exponentialDelayMs;
 
 		this._emit({
 			type: "auto_retry_start",
